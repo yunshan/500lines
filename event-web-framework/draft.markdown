@@ -1,7 +1,7 @@
 title: An Event-driven Web Framework
 author: Leo Zovic
 
-In 2013, I decided to write a [web-based game prototyping tool](https://github.com/Inaimathi/deal) for card and board games. In these types of games, it is common for one player to wait for a while for the other player to make a move; however, when the other player finally does take action, we would like for the waiting player to be notified of the move quickly thereafter.
+In 2013, I decided to write a [web-based game prototyping tool](https://github.com/Inaimathi/deal) for card and board games called _House_. In these types of games, it is common for one player to wait for a while for the other player to make a move; however, when the other player finally does take action, we would like for the waiting player to be notified of the move quickly thereafter.
 
 This is a problem that turns out to be more complicated than it seems at first. In this chapter, we'll explore the issues with using HTTP to build this sort of interaction, and then we'll build a _web framework_ in Common Lisp that allows us to solve similar problems in the future. 
 
@@ -95,9 +95,9 @@ In this loop, we have:
 - an infinite loop waiting for new handshakes or incoming data on an existing connection;
 - cleanup clauses to prevent dangling sockets that are unexpectedly killed (e.g. by an interrupt)
 
-If you haven't written a Common Lisp program before, this code block requires some explanation. What we have written here is a `method` definition (`def`). While Lisp is popularly known as a functional language, it also has its own system for object-oriented programming called "The Common Lisp Object System", which is usually abbreviated as "CLOS"[^CLOSpronounce]. 
+If you haven't written a Common Lisp program before, this code block requires some explanation. What we have written here is a _method definition_. While Lisp is popularly known as a functional language, it also has its own system for object-oriented programming called "The Common Lisp Object System", which is usually abbreviated as "CLOS"[^CLOSpronounce]. 
 
-[^CLOSpronounce]: Pronounced "KLOS", "see-loss" or "see-lows", depending on who you talk to.
+[^CLOSpronounce]: Pronounced "kloss", "see-loss" or "see-lows", depending on who you talk to.
 
 ### CLOS and Generic Functions
 
@@ -199,9 +199,7 @@ This is the first time we're seeing I/O in our event loop. In our discussion in 
 
 ### Processing Connections Without Blocking
 
-The basis of our approach to processing connections without blocking is the library function `read-char-no-hang`](http://clhs.lisp.se/Body/f_rd_c_1.htm), which immediately returns `nil` when called on a stream that has no available data. Where there is data to be read, we use a buffer to store intermediate input for this connection.
-
-[^readcharnohang]: http://clhs.lisp.se/Body/f_rd_c_1.htm
+The basis of our approach to processing connections without blocking is the library function [`read-char-no-hang`](http://clhs.lisp.se/Body/f_rd_c_1.htm), which immediately returns `nil` when called on a stream that has no available data. Where there is data to be read, we use a buffer to store intermediate input for this connection.
 
 ```lisp
     (defmethod buffer! ((buffer buffer))
@@ -344,7 +342,7 @@ Before we discuss rendering responses, we have to consider that there are two ki
 	   (body :accessor body :initform nil :initarg :body)))
 ```
 
-The second is an [SSE messages](http://www.w3.org/TR/eventsource/), which we will use to send an incremental update to our clients.
+The second is an [SSE message](http://www.w3.org/TR/eventsource/), which we will use to send an incremental update to our clients.
 
 ```lisp
 	(defclass sse ()
@@ -354,9 +352,9 @@ The second is an [SSE messages](http://www.w3.org/TR/eventsource/), which we wil
 	   (data :reader data :initarg :data)))
 ```
 
-We'll send an HTTP response whenever we receive a full HTTP request; however, how do we know when and where to send SSE messages in cases where there wasn't an originating client request?
+We'll send an HTTP response whenever we receive a full HTTP request; however, how do we know when and where to send SSE messages without an originating client request?
 
-A simple solution is by registered _channels_, to which we'll subscribe `socket`s as necessary.
+A simple solution is to register _channels_, to which we'll subscribe `socket`s as necessary.
 
 ```lisp
 	(defparameter *channels* (make-hash-table))
@@ -381,7 +379,7 @@ We can then `publish!` notifications to said channels as soon as they become ava
 		     collect it))))
 ```
 
-In `publish!`, we call `write!` to actually write an `sse` to a socket. We'll also need a specialization of `write!` on `response`s to write full HTTP responses as well. Let's handle the `response` case first.
+In `publish!`, we call `write!` to actually write an `sse` to a socket. We'll also need a specialization of `write!` on `response`s to write full HTTP responses as well. Let's handle the HTTP case first.
 
 ```lisp
 	(defmethod write! ((res response) (sock usocket))
@@ -415,7 +413,145 @@ Writing an `SSE` out is conceptually similar to, but mechanically different from
 
 This is simpler than working with full HTTP responses since the SSE message standard doesn't specify `CRLF` line-endings, so we can get away with a single `format` call. The `~@[...~]` blocks are _conditional directives_, which allow us to gracefully handle `nil` slots. For example, if `(id res)` is non-nil, we'll output `id: <the id here> `, otherwise we will ignore the directive entirely. The payload of our incremental update `data` is the only required slot of `sse`, so we can include it without worrying about it being `nil`.
 
-## Extending Our Server Into a Web Framework
+## Extending the Server Into a Web Framework
+
+We have now built a reasonably functional web server that will move requests, responses, and messages to and from clients. The actual work of any web application hosted by this server is done by delegating to handler functions, which were introduced in FIXME but left underspecified there.
+
+The interface between our server and the hosted application is an important one, because it dictates how easily application programmers can work with our infrastructure. Ideally, our handler interface would map parameters from a request to a function that does the real work:
+
+```lisp
+    (define-handler (source :close-socket? nil) (room)
+       (subscribe! (intern room :keyword) sock))
+
+    (define-handler (send-message) (room name message)
+       (publish! (intern room :keyword) (encode-json-to-string `((:name . ,name) (:message . ,message)))))
+
+    (define-handler (index) ()
+       (with-html-output-to-string (s nil :prologue t :indent t)
+         (:html
+           (:head (:script :type "text/javascript" :src "/static/js/interface.js"))
+           (:body (:div :id "messages")
+	              (:textarea :id "input")
+	              (:button :id "send" "Send")))))
+```
+
+One of the concerns I had in mind when writing House was that, like any application open to the greater internet, it would be processing requests from untrusted clients. It would be nice to be able to say specifically what _type_ of data each request should contain by providing a small _schema_ that describes the data. Our previous list of handlers would then look like this:
+
+```lisp
+    (defun len-between (min thing max)
+	  (>= max (length thing) min))
+
+    (define-handler (source :close-socket? nil) ((room :string (len-between 0 room 16)))
+       (subscribe! (intern room :keyword) sock))
+
+    (define-handler (send-message)
+	    ((room :string (len-between 0 room 16))
+	     (name :string (len-between 1 name 64))
+	     (message :string (len-between 5 message 256)))
+       (publish! (intern room :keyword) (encode-json-to-string `((:name . ,name) (:message . ,message)))))
+
+    (define-handler (index) ()
+       (with-html-output-to-string (s nil :prologue t :indent t)
+         (:html
+           (:head (:script :type "text/javascript" :src "/static/js/interface.js"))
+           (:body (:div :id "messages")
+	              (:textarea :id "input")
+	              (:button :id "send" "Send")))))
+```
+
+While we are still working with Lisp code, this interface is starting to look almost like a _declarative language_, in which we state _what_ we want our handlers to validate without thinking too much about _how_ they are going to do it. What we are doing is building a _domain-specific language_ (DSL) for handler functions; that is, we are creating a specific convention and syntax that allows us to concisely express exactly what we want our handlers to validate. This approach of building a small language to solve your problem at hand is frequently used by Lisp programmers, and it is a useful technique that can be used in other programming languages.
+
+### A DSL for Handlers
+
+Now that we have a loose specification for how we want our handler DSL to look, how do we implement it? That is, what specifically do we expect to happen when we call `define-handler`? Let's consider the definition for `send-message` from above:
+
+```
+    (define-handler (send-message)
+	    ((room :string (len-between 0 room 16))
+	     (name :string (len-between 1 name 64))
+	     (message :string (len-between 5 message 256)))
+       (publish! (intern room :keyword) (encode-json-to-string `((:name . ,name) (:message . ,message)))))
+```
+
+What we would like `define-handler` to do here is:
+
+1. Bind the action `(publish! ...)` to the URI `/send-message` in the handlers table. 
+2. When a request to this URI is made, ensure that the HTTP parameters `room`, `name` and `message` were included, and 
+3. validate that `room` is a string no longer than 16 characters, `name` is a string of between 1 and 64 characters (inclusive) and finally that `message` is a string of between 5 and 256 characters (also inclusive). 
+4. After the response has been returned, close the channel.
+
+While we could write Lisp functions to do all of these things, and then manually assemble the pieces ourselves, a more common approach is to use a Lisp facility called `macros` to _generate_ the code for us. This allows us to concisely express what we want our DSL to do, without having to maintain a lot of code to do it. You can think of a macro as an "executable template" that will be expanded into Lisp code at runtime.
+
+Here's our `define-handler` macro:
+```lisp
+    (defmacro define-handler ((name &key (close-socket? t) (content-type "text/html")) (&rest args) &body body)
+      (if close-socket?
+          `(bind-handler ,name (make-closing-handler (:content-type ,content-type) ,args ,@body))
+          `(bind-handler ,name (make-stream-handler ,args ,@body))))
+```
+
+It delegates to three other macros (`bind-handler`, `make-closing-handler`, `make-stream-handler`) that we will define later. `make-closing-handler` will create a handler for a full HTTP request/response cycle; `make-stream-handler` will instead handle an SSE message. The predicate `close-socket?` tells us what kind of definition this is. The backtick and comma are macro-specific operators that we can use to "cut holes" in our code that will be filled out by values specified in our Lisp code when we actually use `define-handler`.
+
+Notice how closely our macro conforms to our specification of what we wanted `define-handler` to do: If we were to write a series of Lisp functions to do all of these things, the intent of the code would be much more difficult to discern by inspection. 
+
+Let's step through the expansion for the `send-message` handler so that we better understand what is actually going on when Lisp "expands" our macro for us. We'll use the macro expansion feature from the [SLIME](https://common-lisp.net/project/slime/) Emacs mode to do this. Calling `macro-expander` on `define-handler` will expand our macro by "one level", leaving our delegated macros in their still-condensed form:
+
+```lisp
+    (BIND-HANDLER SEND-MESSAGE
+       (MAKE-CLOSING-HANDLER (:CONTENT-TYPE "text/html")
+           ((ROOM :STRING (LEN-BETWEEN 0 ROOM 16))
+            (NAME :STRING (LEN-BETWEEN 1 NAME 64))
+            (MESSAGE :STRING (LEN-BETWEEN 5 MESSAGE 256)))
+         (PUBLISH! (INTERN ROOM :KEYWORD)
+                   (ENCODE-JSON-TO-STRING `((:NAME ,@NAME) (:MESSAGE ,@MESSAGE))))))
+```
+
+Our macro has already saved us a bit of typing by substituting our `send-message` specific code into our handler template. `bind-handler` is another macro which maps a URI to a handler function on our handlers table; since it's now at the root of our expansion, let's see how it is defined before expanding this further.
+
+```lisp
+	(defmacro bind-handler (name handler)
+	  (assert (symbolp name) nil "`name` must be a symbol")
+	  (let ((uri (if (eq name 'root) "/" (format nil "/~(~a~)" name))))
+	    `(progn
+	       (when (gethash ,uri *handlers*)
+		 (warn ,(format nil "Redefining handler '~a'" uri)))
+	       (setf (gethash ,uri *handlers*) ,handler))))
+```
+
+The binding happens in the last line; `(setf (gethash ,uri *handlers*) ,handler)`, which is what hash-table assignments look like in Common Lisp (modulo the commas, which are part of our macro.) Note that the `assert` is outside of the quoted area, which means that it'll be run as soon as the macro is _called_ rather than when its result is evaluated.
+
+When we further expand our expansion of the `send-message` `define-handler` above, we get:
+
+```lisp
+    (PROGN
+     (WHEN (GETHASH "/send-message" *HANDLERS*)
+       (WARN "Redefining handler '/send-message'"))
+     (SETF (GETHASH "/send-message" *HANDLERS*)
+             (MAKE-CLOSING-HANDLER (:CONTENT-TYPE "text/html")
+                 ((ROOM :STRING (LEN-BETWEEN 0 ROOM 16))
+                  (NAME :STRING (LEN-BETWEEN 1 NAME 64))
+                  (MESSAGE :STRING (LEN-BETWEEN 5 MESSAGE 256)))
+               (PUBLISH! (INTERN ROOM :KEYWORD)
+                         (ENCODE-JSON-TO-STRING
+                          `((:NAME ,@NAME) (:MESSAGE ,@MESSAGE)))))))
+```
+
+This is starting to look more like a custom implementation of what we would have written to marshal a request from a URI to a handler function had we written it all ourselves. But we didn't have to!
+
+We still have `make-closing-handler` left to go in our expansion. Here is its definition:
+
+```lisp
+	(defmacro make-closing-handler ((&key (content-type "text/html")) (&rest args) &body body)
+	  `(lambda (sock parameters)
+	     (declare (ignorable parameters))
+	     ,(arguments args
+			 `(let ((res (make-instance 
+				      'response 
+				      :content-type ,content-type 
+				      :body (progn ,@body))))
+			    (write! res sock)
+			    (socket-close sock)))))
+```
 
 
 === OUTLINE ===
